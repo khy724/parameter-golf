@@ -223,7 +223,7 @@ class Muon(torch.optim.Optimizer):
 # Reduces computation during evaluation by dynamically pruning less important components
 
 class ShadowLLMPredictor(nn.Module):
-    def __init__(self, model_dim: int, predictor_dim: int, num_layers: int, num_heads: int):
+    def __init__(self, model_dim: int, predictor_dim: int, num_layers: int, num_heads: int, mlp_mult: int = 3):
         super().__init__()
         self.predictor = nn.Sequential(
             nn.Linear(model_dim, predictor_dim),
@@ -235,8 +235,9 @@ class ShadowLLMPredictor(nn.Module):
 
         # Output heads: head masks for each layer (layers 2-11, 8 heads each)
         self.head_masks = nn.Linear(predictor_dim, (num_layers - 1) * num_heads)
-        # Output heads: neuron masks for each layer (layers 2-11, model_dim neurons each)
-        self.neuron_masks = nn.Linear(predictor_dim, (num_layers - 1) * model_dim)
+        # Output heads: neuron masks for each layer (layers 2-11, MLP hidden dim each)
+        # Hidden dim = model_dim * mlp_mult (e.g., 512 * 3 = 1536)
+        self.neuron_masks = nn.Linear(predictor_dim, (num_layers - 1) * model_dim * mlp_mult)
 
         # Initialize masks to be permissive (close to 1.0)
         nn.init.constant_(self.head_masks.bias, 2.0)  # Sigmoid(2.0) ≈ 0.88
@@ -448,7 +449,8 @@ def dequantize_state_dict_int8(quantized_state: dict) -> dict:
 def load_data_shard(file: Path) -> Tensor:
     """Load a data shard from binary file."""
     with open(file, "rb") as f:
-        return torch.frombuffer(f.read(), dtype=torch.uint16).long()
+        # .clone().long() is necessary because frombuffer creates a read-only tensor
+        return torch.frombuffer(f.read(), dtype=torch.uint16).clone().long()
 
 
 class DataLoader:
@@ -927,7 +929,7 @@ class GPT(nn.Module):
         # ShadowLLM predictor (only active during evaluation)
         if shadowllm_enabled:
             self.shadow_predictor = ShadowLLMPredictor(
-                model_dim, shadowllm_predictor_dim, num_layers, num_heads
+                model_dim, shadowllm_predictor_dim, num_layers, num_heads, mlp_mult
             )
 
         self.apply(self._init_weights)
@@ -1220,8 +1222,9 @@ def main() -> None:
     if args.ema_enabled:
         ema_averager = EMAWeightAverager(base_model, args.ema_decay)
 
-    # Compile model if enabled (default: on for competition speed, off for debugging)
-    if int(os.environ.get("USE_COMPILE", "1")):
+    # Compile model if enabled (default: off for now due to CUDA assertion issues with compiled code)
+    # Set USE_COMPILE=1 to enable compilation after debugging
+    if int(os.environ.get("USE_COMPILE", "0")):
         compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     else:
         compiled_model = base_model
