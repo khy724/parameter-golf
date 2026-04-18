@@ -9,6 +9,7 @@ import struct
 import copy
 import glob
 import io
+import random
 import math
 import os
 import random
@@ -36,10 +37,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 class Hyperparameters:
     # Data paths
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
+    data_path = os.environ.get("DATA_PATH", "/workspace/data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", "/workspace/data/tokenizers/fineweb_1024_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -511,8 +512,8 @@ def build_sentencepiece_luts(
         base_bytes_np[token_id] = len(piece.encode("utf-8"))
     return (
         torch.tensor(base_bytes_np, dtype=torch.int16, device=device),
-        torch.tensor(has_leading_space_np, dtype=torch.bool_, device=device),
-        torch.tensor(is_boundary_token_np, dtype=torch.bool_, device=device),
+        torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
+        torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
     )
 
 
@@ -569,7 +570,7 @@ def eval_val_sliding_window(
             windows = []
             targets = []
             for i in range(0, len(local) - args.train_seq_len, stride):
-                if i + args.train_seq_len < len(local):
+                if i + args.train_seq_len + 1 <= len(local):
                     windows.append(local[i:i + args.train_seq_len])
                     targets.append(local[i + 1:i + args.train_seq_len + 1])
 
@@ -944,7 +945,7 @@ class GPT(nn.Module):
             if not self.tie_embeddings:
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor, should_apply_masks:bool) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
 
@@ -967,7 +968,7 @@ class GPT(nn.Module):
 
             # During training, apply masks with 10% probability to avoid distribution shift
             # During evaluation, always apply masks.
-            should_apply_masks = not self.training or (self.training and torch.rand(1).item() < 0.1)
+            # should_apply_masks = not self.training or (self.training and random.random() < 0.1)
             if not should_apply_masks:
                 head_masks = None
                 neuron_masks = None
@@ -1333,8 +1334,11 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            do_masking = (not model.training) or (random.random() < 0.1)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                loss = model(x, y, should_apply_masks=do_masking)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps

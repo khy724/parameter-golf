@@ -9,7 +9,7 @@ from huggingface_hub import hf_hub_download
 
 REPO_ID = os.environ.get("MATCHED_FINEWEB_REPO_ID", "willdepueoai/parameter-golf")
 REMOTE_ROOT_PREFIX = os.environ.get("MATCHED_FINEWEB_REMOTE_ROOT_PREFIX", "datasets")
-ROOT = Path(__file__).resolve().parent
+ROOT = Path('/workspace/data')#Path(__file__).resolve().parent
 DATASETS_DIR = ROOT / "datasets"
 TOKENIZERS_DIR = ROOT / "tokenizers"
 
