@@ -449,9 +449,20 @@ def dequantize_state_dict_int8(quantized_state: dict) -> dict:
 
 def load_data_shard(file: Path) -> Tensor:
     """Load a data shard from binary file."""
-    with open(file, "rb") as f:
-        # .clone().long() is necessary because frombuffer creates a read-only tensor
-        return torch.frombuffer(f.read(), dtype=torch.uint16).clone().long()
+    header_bytes = 256 * np.dtype("<i4").itemsize
+    token_bytes = np.dtype("<u2").itemsize
+    header = np.fromfile(file, dtype="<i4", count=256)
+    # SHARD HEADER INTS & SHARD_MAGIC
+    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
+        raise ValueError(f"Unexpected shard header for {file}")
+    num_tokens = int(header[2])
+    expected_size = header_bytes + num_tokens * token_bytes
+    if file.stat().st_size != expected_size:
+        raise ValueError(f"Shard size mismatch for {file}: expected {expected_size} bytes")
+    tokens_np = np.fromfile(file, dtype="<u2", count=num_tokens, offset=header_bytes)
+    if tokens_np.size != num_tokens:
+        raise ValueError(f"Short read for {file}")
+    return torch.from_numpy(tokens_np.astype(np.int64)).pin_memory()
 
 
 class DataLoader:
@@ -484,8 +495,8 @@ class DataLoader:
         batch_data = self.current_data[start_pos:end_pos]
         self.current_position = end_pos
 
-        x = batch_data[:-1].reshape(local_batch_seqs, seq_len)
-        y = batch_data[1:].reshape(local_batch_seqs, seq_len)
+        x = batch_data[:-1].reshape(local_batch_seqs, seq_len).long()
+        y = batch_data[1:].reshape(local_batch_seqs, seq_len).long()
 
         return x, y
 
@@ -729,6 +740,8 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: Tensor) -> Tensor:
+        if torch.isnan(x).any():
+            print("NaN detected before RMSNorm!")
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
@@ -946,6 +959,14 @@ class GPT(nn.Module):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor, should_apply_masks:bool) -> Tensor:
+        # if input_ids.is_cuda:
+        #     max_id = input_ids.max().item()
+        #     vocab_limit = self.tok_emb.num_embeddings
+        
+        #     if max_id >= vocab_limit:
+        #         # This print will tell you exactly what is wrong
+        #         print(f"\n[!] EMBEDDING CRASH: Max ID {max_id} is out of bounds for vocab {vocab_limit}")
+        #         print(f"[!] Weight matrix actual shape: {self.tok_emb.weight.shape}\n")
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
 
