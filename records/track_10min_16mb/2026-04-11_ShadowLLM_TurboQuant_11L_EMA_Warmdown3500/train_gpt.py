@@ -79,7 +79,7 @@ class Hyperparameters:
         train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
         # Training length
-        iterations = int(os.environ.get("ITERATIONS", 20000))
+        iterations = int(os.environ.get("ITERATIONS", 1))
         warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))  # Extended warmdown
         warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
         train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
@@ -234,11 +234,11 @@ class ShadowLLMPredictor(nn.Module):
             nn.Linear(predictor_dim, predictor_dim),
         )
 
-        # Output heads: head masks for each layer (layers 2-11, 8 heads each)
-        self.head_masks = nn.Linear(predictor_dim, (num_layers - 1) * num_heads)
-        # Output heads: neuron masks for each layer (layers 2-11, MLP hidden dim each)
+        # Output heads: head masks for each recursive pass, one per logical layer
+        self.head_masks = nn.Linear(predictor_dim, num_layers * num_heads)
+        # Output heads: neuron masks for each recursive pass, one per logical layer
         # Hidden dim = model_dim * mlp_mult (e.g., 512 * 3 = 1536)
-        self.neuron_masks = nn.Linear(predictor_dim, (num_layers - 1) * model_dim * mlp_mult)
+        self.neuron_masks = nn.Linear(predictor_dim, num_layers * model_dim * mlp_mult)
 
         # Initialize masks to be permissive (close to 1.0)
         nn.init.constant_(self.head_masks.bias, 2.0)  # Sigmoid(2.0) ≈ 0.88
@@ -301,16 +301,24 @@ def turboquant_quantize_weights(
     k_bits: int = 4,
     v_bits: int = 2,
     rotation_iters: int = 100,
-    salient_masks: dict = None
+    salient_masks: dict = None,
 ) -> dict:
     """Apply TurboQuant V3 with asymmetric bit allocation and saliency-aware quantization."""
     quantized_state = {}
+    seen_data_ptrs: dict[int, str] = {}
 
     for name, param in state_dict.items():
         if param.ndim != 2:
             # Keep non-matrix parameters in original precision
             quantized_state[name] = param.clone()
             continue
+
+        pointer = int(param.data_ptr())
+        if pointer in seen_data_ptrs:
+            # Avoid quantizing the same tied/shared weight tensor twice.
+            quantized_state[name] = quantized_state[seen_data_ptrs[pointer]]
+            continue
+        seen_data_ptrs[pointer] = name
 
         # Check if this parameter contains salient weights
         has_salient_weights = salient_masks is not None and name in salient_masks and salient_masks[name].any()
@@ -486,7 +494,10 @@ class DataLoader:
             # Load next file
             if self.current_file_idx >= len(self.files):
                 self.current_file_idx = 0  # Loop back to beginning
+            begin = time.time()
             self.current_data = load_data_shard(self.files[self.current_file_idx])
+            end = time.time()
+            print(f"Time taken to load data shard: {end - begin:.2f} seconds")
             self.current_position = 0
             self.current_file_idx += 1
 
@@ -689,21 +700,28 @@ def compute_saliency(activations: Tensor, gradients: Tensor) -> Tensor:
     """Compute saliency using plainact criterion (Activation × Gradient)."""
     return activations * gradients
 
-def identify_salient_weights(model: nn.Module, threshold_percentile: float = 99.0) -> dict:
+def identify_salient_weights(
+    model: nn.Module,
+    threshold_percentile: float = 99.0,
+    gradients: Optional[dict[str, Tensor]] = None,
+) -> dict:
     """Identify top 1% of salient weights that require higher precision."""
     salient_masks = {}
+    if gradients is None:
+        gradients = {name: param.grad for name, param in model.named_parameters()}
 
     for name, param in model.named_parameters():
-        if param.grad is not None and param.ndim == 2:
+        grad = gradients.get(name)
+        if grad is not None and param.ndim == 2:
             # Compute saliency for each weight
-            saliency = compute_saliency(param.data, param.grad.data)
+            saliency = compute_saliency(param.data, grad)
             saliency_flat = saliency.abs().flatten()
 
             # Find threshold for top 1%
-            threshold = torch.quantile(saliency_flat, threshold_percentile / 100.0)
+            threshold = torch.quantile(saliency_flat.float(), threshold_percentile / 100.0)
 
             # Create mask for salient weights
-            salient_mask = (saliency.abs() >= threshold).float()
+            salient_mask = (saliency.abs() >= threshold).bool()
             salient_masks[name] = salient_mask
 
     return salient_masks
@@ -715,20 +733,24 @@ def identify_salient_weights(model: nn.Module, threshold_percentile: float = 99.
 class EMAWeightAverager:
     def __init__(self, model: nn.Module, decay: float = 0.997):
         self.decay = decay
-        self.shadow_params = {name: param.clone().detach()
-                            for name, param in model.named_parameters()}
+        self.shadow_params = {
+            name: tensor.clone().detach()
+            for name, tensor in model.state_dict().items()
+        }
 
     def update(self, model: nn.Module):
         """Update EMA parameters."""
         with torch.no_grad():
             for name, param in model.named_parameters():
-                self.shadow_params[name].mul_(self.decay).add_(param.data, alpha=1 - self.decay)
+                if name in self.shadow_params:
+                    self.shadow_params[name].mul_(self.decay).add_(param.data, alpha=1 - self.decay)
 
     def apply_to_model(self, model: nn.Module):
         """Apply EMA parameters to model."""
         with torch.no_grad():
             for name, param in model.named_parameters():
-                param.data.copy_(self.shadow_params[name])
+                if name in self.shadow_params:
+                    param.data.copy_(self.shadow_params[name])
 
 # -----------------------------
 # ADVANCED GPT ARCHITECTURE WITH SHADOWLLM
@@ -932,11 +954,10 @@ class GPT(nn.Module):
         if tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=tied_embed_init_std)
 
-        # Create a pool of 6 physical blocks instead of 11
-        self.blocks = nn.ModuleList([
-            TransformerBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-            for _ in range(6)
-        ])
+        # Use one shared block recursively across all logical layers.
+        # This dramatically reduces parameter count versus 11 unique Transformer blocks.
+        self.shared_block = TransformerBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+        self.layer_pre_norms = nn.ModuleList([RMSNorm() for _ in range(num_layers)])
 
         self.final_norm = RMSNorm()
 
@@ -958,7 +979,7 @@ class GPT(nn.Module):
             if not self.tie_embeddings:
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor, should_apply_masks:bool) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor, should_apply_masks:bool=True) -> Tensor:
         # if input_ids.is_cuda:
         #     max_id = input_ids.max().item()
         #     vocab_limit = self.tok_emb.num_embeddings
@@ -975,10 +996,10 @@ class GPT(nn.Module):
         neuron_masks = None
         if self.shadowllm_enabled:
             pred_head_masks, pred_neuron_masks = self.shadow_predictor(x)
-            # Reshape masks for each layer
+            # Reshape masks for each recursive pass
             batch_size = x.size(0)
-            head_masks = pred_head_masks.view(batch_size, self.num_layers - 1, -1)
-            neuron_masks = pred_neuron_masks.view(batch_size, self.num_layers - 1, -1)
+            head_masks = pred_head_masks.view(batch_size, self.num_layers, -1)
+            neuron_masks = pred_neuron_masks.view(batch_size, self.num_layers, -1)
 
             # Encourage the predictor to keep only the most important heads/neurons.
             # This prevents it from collapsing to all-ones and forces pruning pressure.
@@ -996,26 +1017,16 @@ class GPT(nn.Module):
         else:
             mask_penalty = 0.0
 
-        # Map 11 layers to 6 physical blocks
-        # Layer 0: Block 0
-        # Layers 1-2: Share Block 1
-        # Layers 3-4: Share Block 2
-        # Layers 5-6: Share Block 3
-        # Layers 7-8: Share Block 4
-        # Layer 9-10: Share Block 5
-        layer_mapping = [0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5]
-
         for i in range(self.num_layers):
-            block_idx = layer_mapping[i]
-            # Apply ShadowLLM masks only for layers 2-11 (indices 1-10)
             layer_head_mask = None
             layer_neuron_mask = None
-            if head_masks is not None and 1 <= i < self.num_layers:
-                layer_head_mask = head_masks[:, i-1]  # [batch_size, num_heads]
-            if neuron_masks is not None and 1 <= i < self.num_layers:
-                layer_neuron_mask = neuron_masks[:, i-1]  # [batch_size, hidden_dim]
+            if head_masks is not None:
+                layer_head_mask = head_masks[:, i]  # [batch_size, num_heads]
+            if neuron_masks is not None:
+                layer_neuron_mask = neuron_masks[:, i]  # [batch_size, hidden_dim]
 
-            x = self.blocks[block_idx](x, layer_head_mask, layer_neuron_mask)
+            x = self.layer_pre_norms[i](x)
+            x = self.shared_block(x, layer_head_mask, layer_neuron_mask)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1184,6 +1195,25 @@ def main() -> None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
 
+    # def estimate_submission_size(model, code_path):
+    #     # 1. Calculate parameter count (excluding tied weights)
+    #     unique_params = 0
+    #     seen_ptrs = set()
+    #     for p in model.parameters():
+    #         if p.data_ptr() not in seen_ptrs:
+    #             unique_params += p.numel()
+    #             seen_ptrs.add(p.data_ptr())
+        
+    #     # 2. Estimate quantized size (assuming 1 byte per param for int8)
+    #     # Plus a 10% overhead for headers, scales, and zlib metadata
+    #     estimated_ptz_bytes = unique_params * 1.1 
+        
+    #     # 3. Add code size
+    #     code_bytes = os.path.getsize(code_path)
+    #     total_est_bytes = estimated_ptz_bytes + code_bytes
+        
+    #     return total_est_bytes
+
     log0(code, console=False)
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
@@ -1253,7 +1283,7 @@ def main() -> None:
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer setup (same as before)
-    block_named_params = list(base_model.blocks.named_parameters())
+    block_named_params = list(base_model.shared_block.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
@@ -1307,14 +1337,28 @@ def main() -> None:
     log0(f"turboquant_enabled:{args.turboquant_enabled} k_bits:{args.turboquant_k_bits} v_bits:{args.turboquant_v_bits}")
 
     # Initialize data loader
-    train_files = [Path(p) for p in sorted(glob.glob(args.train_files))]
+    train_files = [Path(p) for p in sorted(glob.glob(args.train_files))][:1]
     train_loader = DataLoader(train_files, args.train_batch_tokens, args.train_seq_len, rank, world_size)
 
+    # Execute check
+    # est_size = estimate_submission_size(model, __file__)
+    # limit = 16.77 * 1024 * 1024 # 16MB Limit in bytes
+
+    # log0(f"PRE-FLIGHT SIZE CHECK:")
+    # log0(f"Estimated Artifact Size: {est_size / 1024 / 1024:.2f} MB")
+
+    # if est_size > limit:
+    #     log0(f"CRITICAL: Model is too large ({est_size/1024/1024:.2f}MB > 16MB)!")
+    #     log0("Please reduce model_dim or num_layers before starting.")
+    #     # Optional: sys.exit(1) if you want to hard-stop
+    # else:
+    #     log0("Size check passed. Proceeding to training...")
     # Training loop
     step = 0
     training_time_ms = 0.0
     max_wallclock_ms = args.max_wallclock_seconds * 1000.0 if args.max_wallclock_seconds > 0 else None
     stop_after_step = None
+    last_backprop_grads: Optional[dict[str, Tensor]] = None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         # Warmup phase
@@ -1364,6 +1408,12 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
+        last_backprop_grads = {
+            name: param.grad.detach().clone()
+            for name, param in base_model.named_parameters()
+            if param.grad is not None
+        }
+
         # Update Muon momentum with warmup
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1404,12 +1454,12 @@ def main() -> None:
             args.val_loss_every > 0
             and (step <= 10 or step % args.val_loss_every == 0 or stop_after_step is not None)
         )
-        if should_validate:
-            val_loss, val_bpb = eval_val(
-                args, model, rank, world_size, device, grad_accum_steps,
-                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut
-            )
-            log0(f"step:{step} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f}")
+        # if should_validate:
+        #     val_loss, val_bpb = eval_val(
+        #         args, model, rank, world_size, device, grad_accum_steps,
+        #         val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut
+        #     )
+        #     log0(f"step:{step} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f}")
 
         training_time_ms = approx_training_time_ms
 
@@ -1428,18 +1478,51 @@ def main() -> None:
     # -----------------------------
     # SALIENCY-AWARE QUANTIZATION
     # -----------------------------
+
+    # log0("Capturing final saliency gradients for TurboQuant...")
+    # model.train() # Ensure we are in train mode for grads
+    # # Use the actual method defined in your custom DataLoader
+    # # Usually it's next_batch(), and it already handles device placement
+    # # Pass the batch config into the loader
+    # # Note: batch_tokens is usually B * T * grad_accum
+    # batch_size = args.val_batch_size if 'args' in locals() else 16 # Adjust based on your script
+    # seq_len = args.train_seq_len if 'args' in locals() else 1024
+    # # grad_accum = args.grad_accum_steps if 'args' in locals() else 8
+
+    # # Fetch the batch using the required arguments
+    # inputs, targets = train_loader.next_batch(
+    #     batch_tokens=batch_size * seq_len * grad_accum,
+    #     seq_len=seq_len,
+    #     grad_accum_steps=grad_accum_steps
+    # )
+
+    # # Standard forward + backward pass
+    # with torch.set_grad_enabled(True):
+    #     logits, loss = model(inputs, targets, should_apply_masks=True)
+    #     loss.backward() 
+
+    # log0("Gradients captured. Proceeding to TurboQuant...")
     if args.turboquant_enabled:
         log0("Applying TurboQuant V3 with saliency-aware quantization...")
+        if last_backprop_grads is None or len(last_backprop_grads) == 0:
+            raise RuntimeError(
+                "TurboQuant saliency requires gradients from the final training backward pass. "
+                "No gradients were captured, so quantization cannot safely proceed."
+            )
 
         def create_quant_obj(percentile: float) -> dict:
-            salient_masks = identify_salient_weights(base_model, threshold_percentile=percentile)
+            salient_masks = identify_salient_weights(
+                base_model,
+                threshold_percentile=percentile,
+                gradients=last_backprop_grads,
+            )
             log0(f"Identified salient weights for {len(salient_masks)} parameter groups at percentile={percentile}")
             return turboquant_quantize_weights(
                 base_model.state_dict(),
                 k_bits=args.turboquant_k_bits,
                 v_bits=args.turboquant_v_bits,
                 rotation_iters=args.turboquant_rotation_iters,
-                salient_masks=salient_masks
+                salient_masks=salient_masks,
             )
 
         quant_obj = create_quant_obj(args.turboquant_salient_percentile)
@@ -1451,11 +1534,13 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_blob = zlib.compress(quant_raw, level=6)
 
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        tmp_path = "final_model.int8.ptz.tmp"
+        with open(tmp_path, "wb") as f:
             f.write(quant_blob)
+        os.replace(tmp_path, "final_model.int8.ptz")
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Total submission size: {quant_file_bytes + code_bytes} bytes")
@@ -1471,9 +1556,11 @@ def main() -> None:
             quant_obj = create_quant_obj(fallback_percentile)
             quant_buf = io.BytesIO()
             torch.save(quant_obj, quant_buf)
-            quant_blob = zlib.compress(quant_buf.getvalue(), level=9)
-            with open("final_model.int8.ptz", "wb") as f:
+            quant_blob = zlib.compress(quant_buf.getvalue(), level=6)
+            tmp_path = "final_model.int8.ptz.tmp"
+            with open(tmp_path, "wb") as f:
                 f.write(quant_blob)
+            os.replace(tmp_path, "final_model.int8.ptz")
             quant_file_bytes = os.path.getsize("final_model.int8.ptz")
             log0(f"Fallback submission size: {quant_file_bytes + code_bytes} bytes")
 
